@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import os
+import signal
 import sys
 import textwrap
 from collections import ChainMap
@@ -12,10 +14,16 @@ from lib4sbom.parser import SBOMParser
 from sbomaudit.audit import SBOMaudit
 from sbomaudit.version import VERSION
 
+
+def _handle_sigint(sig, frame):
+    os._exit(1)
+
 # CLI processing
 
 
 def main(argv=None):
+    signal.signal(signal.SIGINT, _handle_sigint)
+
     argv = argv or sys.argv
     app_name = "sbomaudit"
     parser = argparse.ArgumentParser(
@@ -97,6 +105,13 @@ def main(argv=None):
         help="verbose reporting",
     )
 
+    input_group.add_argument(
+        "--direct-only",
+        action="store_true",
+        default=False,
+        help="only analyse direct dependencies, ignoring transitive ones",
+    )
+
     output_group = parser.add_argument_group("Output")
     output_group.add_argument(
         "--debug",
@@ -113,6 +128,13 @@ def main(argv=None):
         help="output filename (default: output to stdout)",
     )
 
+    output_group.add_argument(
+        "--export-metadata",
+        action="store",
+        default="",
+        help="export package metadata to CSV file",
+    )
+
     parser.add_argument("-V", "--version", action="version", version=VERSION)
 
     defaults = {
@@ -127,7 +149,9 @@ def main(argv=None):
         "allow": "",
         "deny": "",
         "verbose": False,
+        "direct_only": False,
         "output_file": "",
+        "export_metadata": "",
     }
 
     raw_args = parser.parse_args(argv[1:])
@@ -153,7 +177,9 @@ def main(argv=None):
         print("Maximum package age", args["maxage"])
         print("Allow list file", args["allow"])
         print("Deny list file", args["deny"])
+        print("Direct only", args["direct_only"])
         print("Output file", args["output_file"])
+        print("Export metadata", args["export_metadata"])
 
     audit_options = {
         "verbose": args["verbose"],
@@ -164,6 +190,7 @@ def main(argv=None):
         "age": args["age"],
         "maxage": args["maxage"],
         "debug": args["debug"],
+        "direct_only": args["direct_only"],
     }
 
     sbom_parser = SBOMParser()
@@ -182,6 +209,9 @@ def main(argv=None):
         if args["output_file"] != "":
             audit_out = SBOMOutput(args["output_file"], "json")
             audit_out.generate_output(sbom_audit.get_audit())
+
+        if args["export_metadata"] != "":
+            sbom_audit.export_metadata_to_csv(args["export_metadata"])
 
     except FileNotFoundError:
         print(f"{input_file} not found")

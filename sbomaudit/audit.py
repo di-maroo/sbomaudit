@@ -1,6 +1,7 @@
 # Copyright (C) 2023 Anthony Harrison
 # SPDX-License-Identifier: Apache-2.0
 
+import csv
 import datetime
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from lib4sbom.license import LicenseScanner
 from packageurl import PackageURL
 from rich import print
 from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn
 from rich.text import Text
 
 
@@ -25,6 +27,7 @@ class SBOMaudit:
         self.license_check = options.get("license_check", True)
         self.age = int(options.get("age", "0"))
         self.debug = options.get("debug", False)
+        self.direct_only = options.get("direct_only", False)
         DAYS_IN_YEAR = 365
         self.maxage = int(options.get("maxage", "2")) * DAYS_IN_YEAR
         self.license_scanner = LicenseScanner()
@@ -41,6 +44,7 @@ class SBOMaudit:
         self.component = []
         self.element = {}
         self.console_out = output == ""
+        self.metadata_records = []
 
     def get_audit(self):
         return self.audit
@@ -128,6 +132,70 @@ class SBOMaudit:
         latest_date = self.package_metadata.get_latest_release_time()
         return latest_version, latest_date
 
+    def collect_package_metadata(self, name, sbom_version, ecosystem):
+        """Collect metadata for a package and store it for export."""
+        metadata_record = {
+            "name": name,
+            "sbom_version": sbom_version,
+            "latest_version": "",
+            "ecosystem": ecosystem,
+            "license": "",
+            "description": "",
+        }
+
+        if self.offline:
+            self.metadata_records.append(metadata_record)
+            return
+
+        try:
+            if ecosystem == "pypi":
+                url = f"https://pypi.org/pypi/{name}/json"
+                package_json = requests.get(url).json()
+                info = package_json.get("info", {})
+                metadata_record["latest_version"] = info.get("version", "")
+                # Use license field, fall back to license_expression if empty
+                license_value = info.get("license") or info.get("license_expression", "")
+                metadata_record["license"] = license_value or ""
+                metadata_record["description"] = info.get("summary", "")
+            elif ecosystem == "composer":
+                # Use Packagist API for PHP Composer packages
+                url = f"https://packagist.org/packages/{name}.json"
+                package_json = requests.get(url).json()
+                pkg = package_json.get("package", {})
+                metadata_record["description"] = pkg.get("description", "")
+                # Find the latest non-dev version
+                versions = pkg.get("versions", {})
+                for version_key in versions:
+                    if "dev" not in version_key.lower():
+                        ver_info = versions[version_key]
+                        metadata_record["latest_version"] = ver_info.get("version", "")
+                        # License is a list in Packagist
+                        license_list = ver_info.get("license", [])
+                        if isinstance(license_list, list):
+                            metadata_record["license"] = ", ".join(license_list)
+                        else:
+                            metadata_record["license"] = license_list or ""
+                        break
+            else:
+                pkg_metadata = Metadata(ecosystem, debug=self.debug)
+                pkg_metadata.get_package(name)
+                metadata_record["latest_version"] = pkg_metadata.get_latest_version() or ""
+                metadata_record["license"] = pkg_metadata.get_license() or ""
+                metadata_record["description"] = pkg_metadata.get_description() or ""
+        except Exception as error:
+            if self.debug:
+                print(f"Unable to collect metadata for {name}: {error}")
+
+        self.metadata_records.append(metadata_record)
+
+    def export_metadata_to_csv(self, filename):
+        """Export collected package metadata to a CSV file."""
+        fieldnames = ["name", "sbom_version", "latest_version", "ecosystem", "license", "description"]
+        with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.metadata_records)
+
     def process_file(self, filename, allow):
         # Only process if file exists
         if Path(filename).resolve().exists():
@@ -149,6 +217,64 @@ class SBOMaudit:
                 else:
                     data_list[type].append(line.strip())
 
+    def _get_direct_dependencies(self, packages, relationships):
+        """
+        Filter packages to return only direct dependencies.
+        Direct dependencies are packages that have a direct relationship
+        from the root package (the one described by the document).
+        """
+        if not relationships:
+            return packages
+
+        # Find the root package(s) - those that are DESCRIBED by the document
+        # or have DESCRIBES relationship type
+        root_names = set()
+        for r in relationships:
+            rel_type = r.get("type", "").upper()
+            if rel_type == "DESCRIBES":
+                # The target of DESCRIBES is the root package
+                root_names.add(r.get("target"))
+
+        # If no DESCRIBES found, try to find root by looking for packages
+        # that are only sources (not targets) of DEPENDS_ON
+        if not root_names:
+            all_sources = set()
+            all_targets = set()
+            for r in relationships:
+                rel_type = r.get("type", "").upper()
+                if rel_type in ["DEPENDS_ON", "DEPENDENCY_OF"]:
+                    all_sources.add(r.get("source"))
+                    all_targets.add(r.get("target"))
+            # Root packages are those that are sources but not targets
+            root_names = all_sources - all_targets
+
+        if self.debug:
+            print(f"Root package(s): {root_names}")
+
+        # Find direct dependencies - packages that the root directly depends on
+        direct_dep_names = set()
+        for r in relationships:
+            rel_type = r.get("type", "").upper()
+            source = r.get("source")
+            target = r.get("target")
+            if rel_type == "DEPENDS_ON" and source in root_names:
+                direct_dep_names.add(target)
+            elif rel_type == "DEPENDENCY_OF" and target in root_names:
+                direct_dep_names.add(source)
+
+        if self.debug:
+            print(f"Direct dependencies: {direct_dep_names}")
+
+        # Filter packages to only include direct dependencies
+        # Also include the root package itself
+        allowed_names = root_names | direct_dep_names
+        filtered_packages = [
+            p for p in packages
+            if p.get("name") in allowed_names
+        ]
+
+        return filtered_packages
+
     def audit_sbom(self, sbom_parser):
         # Get constituent components of the SBOM
         packages = sbom_parser.get_packages()
@@ -156,6 +282,10 @@ class SBOMaudit:
         relationships = sbom_parser.get_relationships()
         document = SBOMDocument()
         document.copy_document(sbom_parser.get_document())
+
+        # Filter to direct dependencies only if requested
+        if self.direct_only:
+            packages = self._get_direct_dependencies(packages, relationships)
 
         self._heading("SBOM Format Summary")
         fail_count = self.check_count["Fail"]
@@ -336,186 +466,206 @@ class SBOMaudit:
         if len(packages) > 0:
             self._heading("Package Summary")
             fail_count = self.check_count["Fail"]
-            for package in packages:
-                # Minimum elements are ID, Name, Version, Supplier
-                id = package.get("id", None)
-                name = None
-                version = None
-                supplier = None
-                if id is None:
-                    self._check("Package id missing", id)
-                else:
-                    # Get package metadata
-                    name = package.get("name", None)
-                    version = package.get("version", None)
-                    supplier = package.get("supplier", None)
-                    license = package.get("licenseconcluded", "NOT KNOWN")
-                    spdx_license = self.license_scanner.find_license(license) not in [
-                        "UNKNOWN",
-                        "NOASSERTION",
-                    ]
-                    # Check if package is the latest version
-                    external_refs = package.get("externalreference", None)
-                    latest_version = None
-                    latest_date = None
-                    purl_used = False
-                    cpe_used = False
-                    if external_refs is not None:
-                        for external_ref in external_refs:
-                            # Can be two specifications of PACKAGE MANAGER attribute!
-                            if external_ref[0] in [
-                                "PACKAGE-MANAGER",
-                                "PACKAGE_MANAGER",
-                            ]:
-                                purl_used = True
-                                try:
-                                    purl = PackageURL.from_string(
-                                        external_ref[2]
-                                    ).to_dict()
-                                    if not self.offline:
-                                        if purl["type"] == "pypi":
-                                            # Python package detected
-                                            (
-                                                latest_version,
-                                                _,
-                                            ) = self.find_latest_version(name)
-                                            _, latest_date = self.find_latest_version(
-                                                name, version=version
-                                            )
-                                        else:
-                                            (
-                                                latest_version,
-                                                latest_date,
-                                            ) = self.get_package_info(
-                                                name, purl["type"]
-                                            )
-                                    purl_name = purl["name"]
-                                except ValueError:
-                                    purl_used = False
-                                if self.debug:
-                                    print(
-                                        f"Version check for {name} within {purl['type']} ecosystem. {latest_version} {latest_date}"
-                                    )
-                            elif external_ref[1] in ["cpe22Type", "cpe23Type"]:
-                                cpe_used = True
-
-                    # Now summarise
-                    if name is not None:
-                        if allow_packages is not None:
-                            self._check(
-                                f"Allowed Package check for package {name}",
-                                name in allow_packages,
-                                failure_text=f"{name} not allowed",
-                                policy=True,
-                            )
-                        if deny_packages is not None:
-                            self._check(
-                                f"Denied Package check for package {name}",
-                                not (name in deny_packages),
-                                failure_text=f"{name} not allowed",
-                                policy=True,
-                            )
-                        self._check(f"Supplier included for package {name}", supplier)
-                        self._check(f"Version included for package {name}", version)
-                        self._check(
-                            f"License included for package {name}",
-                            not (license in ["NOT KNOWN", "NOASSERTION"]),
-                        )
-                        if self.license_check and license not in [
-                            "NOT KNOWN",
+            pckg_cnt = len(packages)
+            max_name_len = max(len(p.get("name", "unknown")) for p in packages)
+            desc_width = len("Analysing ...") + max_name_len
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                transient=False,
+                disable=not self.console_out,
+            ) as progress:
+                task = progress.add_task("[green]Analysing packages...", total=pckg_cnt)
+                cnt = 0
+                for package in packages:
+                    cnt = cnt + 1
+                    pkg_name = package.get("name", "unknown")
+                    desc = f"Analysing {pkg_name}..."
+                    progress.update(task, description=desc.ljust(desc_width))
+                    # Minimum elements are ID, Name, Version, Supplier
+                    id = package.get("id", None)
+                    name = None
+                    version = None
+                    supplier = None
+                    if id is None:
+                        self._check("Package id missing", id)
+                    else:
+                        # Get package metadata
+                        name = package.get("name", None)
+                        version = package.get("version", None)
+                        supplier = package.get("supplier", None)
+                        license = package.get("licenseconcluded", "NOT KNOWN")
+                        spdx_license = self.license_scanner.find_license(license) not in [
+                            "UNKNOWN",
                             "NOASSERTION",
-                        ]:
-                            self._check(
-                                f"SPDX Compatible License id included for package {name}",
-                                spdx_license,
-                                failure_text=f"{license}",
-                            )
-                            self._check(
-                                f"OSI Approved license for {name}",
-                                self.license_scanner.osi_approved(license),
-                            )
-                            self._check(
-                                f"Non-deprecated license for {name}",
-                                not self.license_scanner.deprecated(license),
-                            )
-                        if allow_licenses is not None:
-                            self._check(
-                                f"Allowed License check for package {name}",
-                                license in allow_licenses,
-                                failure_text=f"{license} not allowed",
-                                policy=True,
-                            )
-                        if deny_licenses is not None:
-                            self._check(
-                                f"Denied License check for package {name}",
-                                not (license in deny_licenses),
-                                failure_text=f"{license} not allowed",
-                                policy=True,
-                            )
-                        if latest_version is not None:
-                            report = f"Version is {version}; latest is {latest_version}"
-                            self._check(
-                                f"Using latest version of package {name}",
-                                latest_version == version,
-                                failure_text=report,
-                            )
-                        if latest_date is not None:
-                            release_date = dateutil.parser.parse(latest_date)
-                            release_age = (
-                                pytz.utc.localize(datetime.datetime.utcnow())
-                                - release_date
-                            )
+                        ]
+                        # Check if package is the latest version
+                        external_refs = package.get("externalreference", None)
+                        latest_version = None
+                        latest_date = None
+                        purl_used = False
+                        cpe_used = False
+                        if external_refs is not None:
+                            for external_ref in external_refs:
+                                # Can be two specifications of PACKAGE MANAGER attribute!
+                                if external_ref[0] in [
+                                    "PACKAGE-MANAGER",
+                                    "PACKAGE_MANAGER",
+                                ]:
+                                    purl_used = True
+                                    try:
+                                        purl = PackageURL.from_string(
+                                            external_ref[2]
+                                        ).to_dict()
+                                        if not self.offline:
+                                            if purl["type"] == "pypi":
+                                                # Python package detected
+                                                (
+                                                    latest_version,
+                                                    _,
+                                                ) = self.find_latest_version(name)
+                                                _, latest_date = self.find_latest_version(
+                                                    name, version=version
+                                                )
+                                            else:
+                                                (
+                                                    latest_version,
+                                                    latest_date,
+                                                ) = self.get_package_info(
+                                                    name, purl["type"]
+                                                )
+                                        purl_name = purl["name"]
+                                        # Collect metadata for export
+                                        self.collect_package_metadata(name, version, purl["type"])
+                                    except ValueError:
+                                        purl_used = False
+                                    if self.debug:
+                                        print(
+                                            f"{cnt} of {pckg_cnt}: Version check for {name} within {purl['type']} ecosystem. {latest_version} {latest_date}"
+                                        )
+                                elif external_ref[1] in ["cpe22Type", "cpe23Type"]:
+                                    cpe_used = True
 
-                            report = f"Age of release is {release_age.days} days"
-                            self._check(
-                                f"Using mature version of package {name}",
-                                release_age.days > self.age,
-                                failure_text=report,
-                                policy=True,
-                            )
-                            # Check age of release if not using the latest version
-                            if latest_version is not None and latest_version != version:
+                        # Now summarise
+                        if name is not None:
+                            if allow_packages is not None:
                                 self._check(
-                                    f"Using old version of package {name}",
-                                    release_age.days < self.maxage,
+                                    f"Allowed Package check for package {name}",
+                                    name in allow_packages,
+                                    failure_text=f"{name} not allowed",
+                                    policy=True,
+                                )
+                            if deny_packages is not None:
+                                self._check(
+                                    f"Denied Package check for package {name}",
+                                    not (name in deny_packages),
+                                    failure_text=f"{name} not allowed",
+                                    policy=True,
+                                )
+                            self._check(f"Supplier included for package {name}", supplier)
+                            self._check(f"Version included for package {name}", version)
+                            self._check(
+                                f"License included for package {name}",
+                                not (license in ["NOT KNOWN", "NOASSERTION"]),
+                            )
+                            if self.license_check and license not in [
+                                "NOT KNOWN",
+                                "NOASSERTION",
+                            ]:
+                                self._check(
+                                    f"SPDX Compatible License id included for package {name}",
+                                    spdx_license,
+                                    failure_text=f"{license}",
+                                )
+                                self._check(
+                                    f"OSI Approved license for {name}",
+                                    self.license_scanner.osi_approved(license),
+                                )
+                                self._check(
+                                    f"Non-deprecated license for {name}",
+                                    not self.license_scanner.deprecated(license),
+                                )
+                            if allow_licenses is not None:
+                                self._check(
+                                    f"Allowed License check for package {name}",
+                                    license in allow_licenses,
+                                    failure_text=f"{license} not allowed",
+                                    policy=True,
+                                )
+                            if deny_licenses is not None:
+                                self._check(
+                                    f"Denied License check for package {name}",
+                                    not (license in deny_licenses),
+                                    failure_text=f"{license} not allowed",
+                                    policy=True,
+                                )
+                            if latest_version is not None:
+                                report = f"Version is {version}; latest is {latest_version}"
+                                self._check(
+                                    f"Using latest version of package {name}",
+                                    latest_version == version,
+                                    failure_text=report,
+                                )
+                            if latest_date is not None:
+                                release_date = dateutil.parser.parse(latest_date)
+                                release_age = (
+                                    pytz.utc.localize(datetime.datetime.utcnow())
+                                    - release_date
+                                )
+
+                                report = f"Age of release is {release_age.days} days"
+                                self._check(
+                                    f"Using mature version of package {name}",
+                                    release_age.days > self.age,
                                     failure_text=report,
                                     policy=True,
                                 )
-                        if self.cpe_check:
-                            self._check(
-                                f"CPE name included for package {name}", cpe_used
-                            )
-                        if self.purl_check:
-                            self._check(
-                                f"PURL included for package {name}",
-                                purl_used,
-                                failure_text="MISSING or INVALID",
-                            )
-                            if purl_used:
-                                # Check name is consistent with package name
+                                # Check age of release if not using the latest version
+                                if latest_version is not None and latest_version != version:
+                                    self._check(
+                                        f"Using old version of package {name}",
+                                        release_age.days < self.maxage,
+                                        failure_text=report,
+                                        policy=True,
+                                    )
+                            if self.cpe_check:
                                 self._check(
-                                    f"PURL name compatible with package {name}",
-                                    purl_name == name,
+                                    f"CPE name included for package {name}", cpe_used
                                 )
-                    else:
-                        self._check(f"Package name missing for {id}", False)
+                            if self.purl_check:
+                                self._check(
+                                    f"PURL included for package {name}",
+                                    purl_used,
+                                    failure_text="MISSING or INVALID",
+                                )
+                                if purl_used:
+                                    # Check name is consistent with package name
+                                    self._check(
+                                        f"PURL name compatible with package {name}",
+                                        purl_name == name,
+                                    )
+                        else:
+                            self._check(f"Package name missing for {id}", False)
 
-                if len(self.component) > 0:
-                    self.element["name"] = name
-                    self.element["version"] = version
-                    self.element["reports"] = self.component
-                    self.package_component.append(self.element)
-                    self.element = {}
-                    self.component = []
+                    if len(self.component) > 0:
+                        self.element["name"] = name
+                        self.element["version"] = version
+                        self.element["reports"] = self.component
+                        self.package_component.append(self.element)
+                        self.element = {}
+                        self.component = []
 
-                if (
-                    id is None
-                    or name is None
-                    or version is None
-                    or supplier is None
-                    or supplier == "NOASSERTION"
-                ):
-                    packages_valid = False
+                    if (
+                        id is None
+                        or name is None
+                        or version is None
+                        or supplier is None
+                        or supplier == "NOASSERTION"
+                    ):
+                        packages_valid = False
+                    progress.advance(task)
             self._check("NTIA compliant", packages_valid, failure_text="FAILED")
 
             # Report if all checks passed
